@@ -5,9 +5,11 @@ import time
 import os
 import shlex
 import threading
+import multiprocessing as mp
 import socket
 import fcntl
 import struct
+import psutil
 
 parser = argparse.ArgumentParser(description='REIP video capture')
 parser.add_argument('--indir', type=str, help='Input directory')
@@ -21,7 +23,7 @@ parser.add_argument('--file_length_seconds', type=int, help='Output file length 
 parser.add_argument('--eth_name', type=str, help='Name of ethernet adaptor on device or container, eg. eth0')
 
 # Example:
-# python2 video_capture.py --indir /home/reip/video_capture/src --outdir /mnt/reipdata --device /dev/video0 --width 2592 --height 1944 --fps 15 --bitrate_kbs 1500 --file_length_seconds 10 --eth_name eth0
+# python video_capture.py --indir /home/reip/video_capture/src --outdir /mnt/reipdata --device /dev/video0 --width 2592 --height 1944 --fps 15 --bitrate_kbs 1500 --file_length_seconds 10 --eth_name eth0
 
 wm = pyinotify.WatchManager()
 
@@ -41,21 +43,41 @@ eth_name = args.eth_name
 
 file_info = {}
 
+recording = True
+
 
 def gethwaddr(ifname):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    info = fcntl.ioctl(s.fileno(), 0x8927,  struct.pack('256s', ifname[:15]))
-    return ''.join(['%02x:' % ord(char) for char in info[18:24]])[:-1].replace(':', '')
+	s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+	info = fcntl.ioctl(s.fileno(), 0x8927,  struct.pack('256s', ifname[:15]))
+	return ''.join(['%02x:' % ord(char) for char in info[18:24]])[:-1].replace(':', '')
+
+
+def cap_proc_dead():
+	for proc in psutil.process_iter():
+		try:
+			if 'gst-launch' in proc.name().lower():
+				return False
+		except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+			pass
+	return True
+
 
 def video_capture(device, width, height, fps, bitrate_kbs, outfname, file_length_seconds):
+	global recording
 	gstr = return_gstreamer_string(device, width, height, fps, bitrate_kbs, outfname, file_length_seconds)
 	record_proc = subprocess.Popen(shlex.split(gstr), stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
 	outs, errs = record_proc.communicate()
-	exit()
+	print('Error: %s' % str(errs))
+	print('Outputs: %s' % str(outs))
+	
+	if cap_proc_dead():
+		print('Recording processes not found - all camera processes have exited - exiting main process')
+		recording = False
+
 
 def get_video_length(filename):
 	result = subprocess.Popen(["ffprobe", filename],
-    stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+	stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
 	return [x for x in result.stdout.readlines() if "Duration" in x]
 
 
@@ -75,22 +97,24 @@ def return_gstreamer_string(device, width, height, fps, bitrate_kbs, outfname, f
 
 
 class EventHandler(pyinotify.ProcessEvent):
-    def process_IN_CLOSE_WRITE(self, event):
-        if event.pathname.endswith(".mp4"):
+	def process_IN_CLOSE_WRITE(self, event):
+		if event.pathname.endswith(".mp4"):
 			path_parts = os.path.normpath(event.pathname).split(os.sep)
 			dev_dir = path_parts[-2]
 			fname = os.path.basename(event.pathname)
 			os.rename(event.pathname, os.path.join(sd_out_path, dev_dir, '%s_%.3f.mp4' % (dev_dir, file_info[fname])))
 			del file_info[fname]
 
-    def process_IN_CREATE(self, event):
-        if event.pathname.endswith(".mp4"):
-            fname = os.path.basename(event.pathname)
-            file_info[fname] = os.path.getmtime(event.pathname)
-            print(file_info)
+	def process_IN_CREATE(self, event):
+		if event.pathname.endswith(".mp4"):
+			fname = os.path.basename(event.pathname)
+			file_info[fname] = os.path.getmtime(event.pathname)
+			print(file_info)
+
 
 sd_out_path = os.path.join(outdir, gethwaddr(eth_name))
 tmp_out_path = os.path.join(indir, gethwaddr(eth_name))
+
 
 if __name__ == "__main__":
 	
@@ -107,7 +131,6 @@ if __name__ == "__main__":
 	print('TMP out path: %s' % tmp_out_path)
 	print('SD out path: %s' % sd_out_path)
 
-
 	dev_idx = 1
 	cap_threads = []
 	for device in devices:
@@ -120,11 +143,19 @@ if __name__ == "__main__":
 			os.makedirs(outsdfname)
 
 		dev_idx += 1
+
 		vid_thread = threading.Thread(target = video_capture, args = (device, width, height, fps, bitrate_kbs, outtmpfname, file_length_seconds))
 		vid_thread.start()
 		cap_threads.append(vid_thread)
 
-	notifier.loop()
+	while recording:
+		try:
+			notifier.process_events()
+			if notifier.check_events(timeout=1000):
+				notifier.read_events()
+		except KeyboardInterrupt:
+			notifier.stop()
+			break
 
 	for cap_thread in cap_threads:
 		cap_thread.join()
