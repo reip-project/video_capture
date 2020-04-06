@@ -88,7 +88,7 @@ def return_gstreamer_string(device, width, height, fps, bitrate_kbs, outfname, f
 			'jpegdec ! ' \
 			'nvvidconv ! ' \
 			'"video/x-raw(memory:NVMM), format=(string)I420" ! ' \
-			'omxh264enc iframeinterval=1 bitrate=%d ! ' \
+			'nvv4l2h264enc iframeinterval=1 bitrate=%d ! ' \
 			'"video/x-h264, stream-format=(string)byte-stream" ! ' \
 			'h264parse ! ' \
 			'splitmuxsink location=%s/out_%%d.mp4 max-size-time=%d' \
